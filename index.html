@@ -1,0 +1,230 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>IoTopia — Live Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    .card { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+    .vital { display:flex; gap:12px; }
+    .alert { color: red; font-weight: bold; margin-top: 6px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border:1px solid #eee; padding:8px; text-align:left; }
+    .hash { font-family: monospace; font-size:12px; }
+    #twinCanvas { width: 100%; height: 350px; display: block; background: #f5f5f5; border-radius: 8px; }
+    .legend { font-size: 14px; margin-top: 8px; }
+    .legend span { display: inline-block; width: 16px; height: 16px; margin-right: 6px; vertical-align: middle; }
+    #mapArea iframe { border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h2>IoTopia — Live Dashboard (Software Prototype)</h2>
+
+  <!-- Live Vitals -->
+  <div class="card">
+    <h3>Live Vitals</h3>
+    <div id="live"></div>
+    <div id="alert" class="alert"></div>
+  </div>
+
+  <!-- Digital Twin -->
+  <div class="card">
+    <h3>Digital Twin (3D Organs Demo)</h3>
+    <canvas id="twinCanvas"></canvas>
+    <div class="legend">
+      <p><span style="background:#00ff00"></span> Normal</p>
+      <p><span style="background:#ff0000"></span> High Heart Rate (Arrhythmia risk)</p>
+      <p><span style="background:#0000ff"></span> Low SpO₂ (Respiratory issue)</p>
+      <p><span style="background:#ffa500"></span> High Temperature (Fever)</p>
+    </div>
+  </div>
+
+  <!-- Emergency Routing Map -->
+  <div class="card">
+    <h3>Emergency Routing</h3>
+    <p>If a critical alert is detected, nearest hospitals will be shown here.</p>
+    <div id="mapArea"></div>
+  </div>
+
+  <!-- Ledger -->
+  <div class="card">
+    <h3>Ledger (Recent Records)</h3>
+    <div id="records">Loading...</div>
+  </div>
+
+  <!-- Three.js -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.min.js"></script>
+
+  <script>
+    const liveDiv = document.getElementById('live');
+    const alertDiv = document.getElementById('alert');
+    const recordsDiv = document.getElementById('records');
+    const mapArea = document.getElementById('mapArea');
+
+    const evtSource = new EventSource('/stream');
+
+    // Queue for slowing down display
+    let recordQueue = [];
+    let processing = false;
+
+    evtSource.onmessage = function(e) {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.type === 'new_record') {
+          recordQueue.push(d);
+          if(!processing) processQueue();
+        }
+      } catch(err){ console.error(err); }
+    }
+
+    async function processQueue() {
+      if(recordQueue.length === 0){ processing = false; return; }
+      processing = true;
+      const d = recordQueue.shift();
+      const rec = d.record;
+
+      showLive(rec);
+      addRecordToLedger(d.id, rec, d.hash);
+      updateDigitalTwin(rec.vitals);
+
+      // Emergency Map for critical vitals
+      if(rec.ai_result !== "Normal") {
+        showMap({lat:12.9716,lng:77.5946}, rec.ai_result);
+      } else {
+        mapArea.innerHTML = "";
+      }
+
+      // Wait 2.5 seconds before showing next record
+      await new Promise(r => setTimeout(r, 2500));
+      processQueue();
+    }
+
+    function showLive(rec){
+      const v = rec.vitals;
+      liveDiv.innerHTML = `
+        <div class="vital">
+          <div>Heart rate: <b>${v.heart_rate}</b></div>
+          <div>SpO2: <b>${v.spo2}</b></div>
+          <div>Glucose: <b>${v.glucose}</b></div>
+          <div>Temp: <b>${v.temp}</b></div>
+        </div>
+      `;
+    }
+
+    async function loadRecords(){
+      const r = await fetch('/records');
+      const arr = await r.json();
+      recordsDiv.innerHTML = renderTable(arr);
+    }
+
+    function addRecordToLedger(id, rec, hash){
+      const tr = `<tr><td>${id}</td><td>${new Date(rec.timestamp*1000).toLocaleString()}</td><td>
+        HR:${rec.vitals.heart_rate}, SpO2:${rec.vitals.spo2}, Gluc:${rec.vitals.glucose}, T:${rec.vitals.temp}</td>
+        <td>${rec.ai_result}</td>
+        <td class="hash">${hash}</td>
+        <td><button onclick="verify(${id}, this)">Verify</button></td>
+      </tr>`;
+      const tbl = document.getElementById('ledger_body');
+      if(tbl) tbl.innerHTML = tr + tbl.innerHTML;
+    }
+
+    function renderTable(arr){
+      if(!arr.length) return 'No records yet.';
+      let rows = arr.map(a=>`<tr><td>${a.id}</td><td>${new Date(a.timestamp*1000).toLocaleString()}</td><td>
+        HR:${a.vitals.heart_rate}, SpO2:${a.vitals.spo2}, Gluc:${a.vitals.glucose}, T:${a.vitals.temp}</td>
+        <td>${a.ai_result}</td>
+        <td class="hash">${a.hash}</td>
+        <td><button onclick="verify(${a.id}, this)">Verify</button></td>
+      </tr>`).join('\n');
+      return `<table><thead><tr><th>ID</th><th>Time</th><th>Vitals</th><th>AI</th><th>Hash</th><th>Verify</th></tr></thead><tbody id="ledger_body">${rows}</tbody></table>`;
+    }
+
+    async function verify(id, btn){
+      btn.disabled = true;
+      const r = await fetch('/verify/'+id);
+      const j = await r.json();
+      alert('Verification: ' + (j.valid ? 'OK — record intact' : 'Mismatch! tampering detected') + '\n\nStored:\n' + j.stored_hash + '\nRecomputed:\n' + j.recomputed);
+      btn.disabled = false;
+    }
+
+    loadRecords();
+
+    // ---------- Digital Twin Setup ----------
+    const canvas = document.getElementById('twinCanvas');
+    const renderer = new THREE.WebGLRenderer({canvas});
+    renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, canvas.clientWidth/canvas.clientHeight, 0.1, 1000);
+    camera.position.z = 6;
+
+    const light = new THREE.PointLight(0xffffff, 1, 100);
+    light.position.set(10, 10, 10);
+    scene.add(light);
+
+    const heartGeometry = new THREE.SphereGeometry(1, 32, 32);
+    const heartMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+    const heart = new THREE.Mesh(heartGeometry, heartMaterial);
+    heart.position.x = -2;
+    scene.add(heart);
+
+    const lungsGeometry = new THREE.BoxGeometry(1.5,2,1);
+    const lungsMaterial = new THREE.MeshStandardMaterial({color:0x00ff00});
+    const lungs = new THREE.Mesh(lungsGeometry, lungsMaterial);
+    lungs.position.x = 2;
+    scene.add(lungs);
+
+    const tempGeometry = new THREE.SphereGeometry(0.7,32,32);
+    const tempMaterial = new THREE.MeshStandardMaterial({color:0x00ff00});
+    const tempSphere = new THREE.Mesh(tempGeometry,tempMaterial);
+    tempSphere.position.y = -2;
+    scene.add(tempSphere);
+
+    function animate(){
+      requestAnimationFrame(animate);
+      heart.rotation.y += 0.01;
+      lungs.rotation.y -= 0.01;
+      tempSphere.rotation.y += 0.02;
+      renderer.render(scene,camera);
+    }
+    animate();
+
+    function updateDigitalTwin(vitals){
+      let alertText = "";
+      if(vitals.heart_rate > 120){
+        heart.material.color.set(0xff0000);
+        alertText = "High Heart Rate — Arrhythmia risk";
+      } else heart.material.color.set(0x00ff00);
+
+      if(vitals.spo2 < 92){
+        lungs.material.color.set(0x0000ff);
+        alertText = "Low SpO₂ — Respiratory issue";
+      } else lungs.material.color.set(0x00ff00);
+
+      if(vitals.temp > 38){
+        tempSphere.material.color.set(0xffa500);
+        alertText = "Fever — possible infection";
+      } else if(vitals.heart_rate<=120 && vitals.spo2>=92){
+        alertText = "";
+      }
+
+      alertDiv.textContent = alertText;
+    }
+
+    // ---------- Emergency Routing Map ----------
+    function showMap(location, alertText){
+      const lat = location.lat;
+      const lng = location.lng;
+      const mapUrl = `https://www.google.com/maps/embed/v1/search?key=AIzaSyDEDkMp7fdvON5loOt2NM_TJ0GbKzh6-4g&q=hospital&center=${lat},${lng}&zoom=14`;
+      mapArea.innerHTML = `
+        <iframe width="100%" height="300" frameborder="0" style="border:0" src="${mapUrl}" allowfullscreen></iframe>
+        <p><b>Critical Alert:</b> ${alertText}</p>
+        <p><b>Nearest hospitals (demo):</b><br>
+          Apollo Hospital, Fortis Hospital, Manipal Hospital
+        </p>
+      `;
+    }
+  </script>
+</body>
+</html>
